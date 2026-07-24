@@ -32,6 +32,10 @@ HTTP reads use exponential backoff with jitter, and honor `Retry-After` on 429. 
 
 `pipeline_checkpoints.cursor_value` advances only after a full page has been validated, upserted, and committed. A crash mid-page re-reads that page; upserts and error hashes keep the destination correct. Counter fields on the checkpoint can over-count slightly in that narrow window; destination tables remain the source of truth for `/stats`.
 
+## Throughput
+
+Loading is batched per page instead of one round trip per record: `upsert_ads_batch`/`isolate_errors_batch` issue a single multi-row `INSERT ... ON CONFLICT` per page (chunked by `PIPELINE_BATCH_SIZE` so a very large page can't produce one oversized statement). Same-page duplicate `ad_id`s are collapsed to the newest `(updated_at, version)` before the statement runs, since Postgres rejects an `ON CONFLICT DO UPDATE` that would touch one row twice in a single statement; the collapsed rows are counted as `skipped`, matching the outcome the old per-record loop already produced. The `/errors` and `/ads` endpoints now run a single targeted `COUNT`, rather than the full `/stats` snapshot (which also queries the other table and the checkpoint) just to read one number.
+
 ## Trade-offs / simplifications
 
 - PostgreSQL instead of BigQuery: identical upsert/idempotency semantics locally, no cloud credentials required for `docker compose up`.
