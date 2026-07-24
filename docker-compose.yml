@@ -1,0 +1,56 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: etl
+      POSTGRES_PASSWORD: etl
+      POSTGRES_DB: ads_intel
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U etl -d ads_intel"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    ports:
+      - "5432:5432"
+
+  source:
+    build: ./source
+    environment:
+      SOURCE_SEED: "42"
+      SOURCE_RECORD_COUNT: "800"
+      SOURCE_DUPLICATE_RATE: "0.12"
+      SOURCE_MALFORMED_RATE: "0.05"
+      SOURCE_TRANSIENT_ERROR_RATE: "0.18"
+      SOURCE_RATE_LIMIT_RPS: "8"
+      SOURCE_PAGE_SIZE: "50"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    ports:
+      - "8080:8080"
+
+  pipeline:
+    build: ./pipeline
+    depends_on:
+      db:
+        condition: service_healthy
+      source:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://etl:etl@db:5432/ads_intel
+      SOURCE_BASE_URL: http://source:8080
+      SOURCE_PAGE_SIZE: "50"
+      HTTP_MAX_RETRIES: "8"
+      HTTP_BASE_DELAY_MS: "200"
+      HTTP_MAX_DELAY_MS: "8000"
+      PIPELINE_BATCH_SIZE: "50"
+    ports:
+      - "8000:8000"
+
+volumes:
+  pgdata:
