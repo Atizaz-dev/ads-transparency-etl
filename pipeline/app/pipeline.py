@@ -11,10 +11,10 @@ from .extract import SourceClient
 from .load import (
     finish_run,
     get_or_create_checkpoint,
-    isolate_error,
+    isolate_errors_batch,
     persist_checkpoint,
     start_run,
-    upsert_ad,
+    upsert_ads_batch,
     validate_record,
 )
 
@@ -60,28 +60,20 @@ class AdsIngestPipeline:
                 checkpoint = get_or_create_checkpoint(session, self.pipeline_name)
 
                 for page_cursor, records, next_cursor in source.iter_pages(start_cursor):
-                    page_loaded = 0
-                    page_skipped = 0
-                    page_failed = 0
+                    valid_records = []
+                    failures = []
 
                     for raw in records:
                         payload = raw if isinstance(raw, dict) else {"raw": raw}
                         record, error = validate_record(payload)
                         if error or record is None:
-                            isolate_error(
-                                session,
-                                payload=payload,
-                                reason=error or "unknown validation failure",
-                                source_cursor=page_cursor,
-                            )
-                            page_failed += 1
-                            continue
-
-                        outcome = upsert_ad(session, record)
-                        if outcome == "loaded":
-                            page_loaded += 1
+                            failures.append((payload, error or "unknown validation failure", page_cursor))
                         else:
-                            page_skipped += 1
+                            valid_records.append(record)
+
+                    isolate_errors_batch(session, failures)
+                    page_loaded, page_skipped = upsert_ads_batch(session, valid_records)
+                    page_failed = len(failures)
 
                     persist_checkpoint(
                         session,

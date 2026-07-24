@@ -9,8 +9,13 @@ from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
+from .config import settings
 from .db import Ad, PipelineCheckpoint, PipelineError, PipelineRun
 from .models import AdRecord
+
+
+def _chunked(items: list, size: int) -> list[list]:
+    return [items[i : i + size] for i in range(0, len(items), max(size, 1))]
 
 
 def validate_record(raw: dict) -> tuple[AdRecord | None, str | None]:
@@ -72,6 +77,80 @@ def upsert_ad(session: Session, record: AdRecord) -> str:
     return "loaded" if result.first() is not None else "skipped"
 
 
+def _newest_per_ad_id(records: list[AdRecord]) -> tuple[list[AdRecord], int]:
+    """Collapse same-batch duplicates to one row per ad_id (same precedence as
+    the ON CONFLICT WHERE gate below), since Postgres rejects a single
+    ON CONFLICT DO UPDATE statement that touches the same row twice."""
+    best: dict[str, AdRecord] = {}
+    for record in records:
+        current = best.get(record.ad_id)
+        if current is None or (record.updated_at, record.version) > (current.updated_at, current.version):
+            best[record.ad_id] = record
+    return list(best.values()), len(records) - len(best)
+
+
+def upsert_ads_batch(session: Session, records: list[AdRecord]) -> tuple[int, int]:
+    """Bulk version of upsert_ad. Returns (loaded_count, skipped_count)."""
+    if not records:
+        return 0, 0
+
+    now = datetime.now(timezone.utc)
+    loaded = 0
+    skipped = 0
+
+    for chunk in _chunked(records, settings.pipeline_batch_size):
+        deduped, in_batch_skipped = _newest_per_ad_id(chunk)
+        skipped += in_batch_skipped
+
+        stmt = insert(Ad).values(
+            [
+                {
+                    "ad_id": r.ad_id,
+                    "advertiser_id": r.advertiser_id,
+                    "advertiser_name": r.advertiser_name,
+                    "platform": r.platform,
+                    "creative_url": r.creative_url,
+                    "impression_count": r.impression_count,
+                    "first_shown_at": r.first_shown_at,
+                    "last_shown_at": r.last_shown_at,
+                    "version": r.version,
+                    "updated_at": r.updated_at,
+                    "ingested_at": now,
+                }
+                for r in deduped
+            ]
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[Ad.ad_id],
+            set_={
+                "advertiser_id": stmt.excluded.advertiser_id,
+                "advertiser_name": stmt.excluded.advertiser_name,
+                "platform": stmt.excluded.platform,
+                "creative_url": stmt.excluded.creative_url,
+                "impression_count": stmt.excluded.impression_count,
+                "first_shown_at": stmt.excluded.first_shown_at,
+                "last_shown_at": stmt.excluded.last_shown_at,
+                "version": stmt.excluded.version,
+                "updated_at": stmt.excluded.updated_at,
+                "ingested_at": now,
+            },
+            where=(
+                (stmt.excluded.updated_at > Ad.updated_at)
+                | (
+                    (stmt.excluded.updated_at == Ad.updated_at)
+                    & (stmt.excluded.version > Ad.version)
+                )
+            ),
+        ).returning(Ad.ad_id)
+
+        result = session.execute(stmt)
+        chunk_loaded = len(result.scalars().all())
+        loaded += chunk_loaded
+        skipped += len(deduped) - chunk_loaded
+
+    return loaded, skipped
+
+
 def isolate_error(
     session: Session,
     payload: dict,
@@ -88,6 +167,28 @@ def isolate_error(
         )
         .on_conflict_do_nothing(index_elements=["payload_hash"])
     )
+    session.execute(stmt)
+
+
+def isolate_errors_batch(
+    session: Session,
+    failures: list[tuple[dict, str, str | None]],
+) -> None:
+    """Bulk version of isolate_error. Each item is (payload, reason, source_cursor)."""
+    if not failures:
+        return
+
+    stmt = insert(PipelineError).values(
+        [
+            {
+                "payload_hash": payload_hash(payload),
+                "source_cursor": source_cursor,
+                "record_payload": payload,
+                "error_reason": reason,
+            }
+            for payload, reason, source_cursor in failures
+        ]
+    ).on_conflict_do_nothing(index_elements=["payload_hash"])
     session.execute(stmt)
 
 
@@ -157,12 +258,18 @@ def finish_run(session: Session, run: PipelineRun, status: str, detail: dict) ->
     run.detail = detail
 
 
-def stats_snapshot(session: Session, pipeline_name: str | None = None) -> dict:
-    from .config import settings
+def count_ads(session: Session) -> int:
+    return session.scalar(select(func.count()).select_from(Ad)) or 0
 
+
+def count_errors(session: Session) -> int:
+    return session.scalar(select(func.count()).select_from(PipelineError)) or 0
+
+
+def stats_snapshot(session: Session, pipeline_name: str | None = None) -> dict:
     name = pipeline_name or settings.pipeline_name
-    loaded = session.scalar(select(func.count()).select_from(Ad)) or 0
-    errors = session.scalar(select(func.count()).select_from(PipelineError)) or 0
+    loaded = count_ads(session)
+    errors = count_errors(session)
     checkpoint = session.get(PipelineCheckpoint, name)
     return {
         "loaded_successfully": loaded,
