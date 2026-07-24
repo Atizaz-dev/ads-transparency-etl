@@ -5,7 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from .db import Ad, PipelineError
-from .load import stats_snapshot
+from .load import count_ads, count_errors, stats_snapshot
 
 
 def create_app(session_factory: sessionmaker[Session]) -> FastAPI:
@@ -26,7 +26,7 @@ def create_app(session_factory: sessionmaker[Session]) -> FastAPI:
         offset: int = Query(default=0, ge=0),
     ) -> dict:
         with session_factory() as session:
-            total = stats_snapshot(session)["isolated_errors"]
+            total = count_errors(session)
             rows = session.scalars(
                 select(PipelineError)
                 .order_by(PipelineError.id.asc())
@@ -55,7 +55,7 @@ def create_app(session_factory: sessionmaker[Session]) -> FastAPI:
         offset: int = Query(default=0, ge=0),
     ) -> dict:
         with session_factory() as session:
-            total = stats_snapshot(session)["loaded_successfully"]
+            total = count_ads(session)
             rows = session.scalars(
                 select(Ad).order_by(Ad.updated_at.desc()).offset(offset).limit(limit)
             ).all()
